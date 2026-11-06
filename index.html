@@ -156,7 +156,8 @@ const tx=(m,f)=>new Promise((ok,no)=>{const t=db.transaction("songs",m),r=f(t.ob
 /* utils */
 const fmt=v=>Number.isFinite(v)?Math.floor(v/60)+":"+String(Math.floor(v%60)).padStart(2,"0"):"0:00";
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
-const byId=id=>songs.find(s=>s.id===id);
+var ONL={};/* lagu online (Audius), hanya selama sesi */
+const byId=id=>songs.find(s=>s.id===id)||ONL[id];
 const getList=id=>lists.find(p=>String(p.id)===String(id));
 function notify(m){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(window.tt);window.tt=setTimeout(()=>t.style.display="none",2200)}
 
@@ -574,13 +575,10 @@ function cleanName(n){
   return n.replace(/[\(\[].*?[\)\]]/g," ").replace(/\b(official|lyrics?|video|audio|hd|hq|mp3|4k|mv)\b/gi," ").replace(/\bft\.?.*$/i," ").replace(/_+/g," ").replace(/\s+/g," ").trim();
 }
 async function lrc(url){
-  const ctl=new AbortController(),to=setTimeout(()=>ctl.abort(),10000);
-  try{
-    const r=await fetch(url,{signal:ctl.signal});
-    if(r.status===404)return [];
-    if(!r.ok)throw new Error(r.status);
-    return await r.json();
-  }finally{clearTimeout(to)}
+  const r=await jget(url,10000); /* tanpa AbortSignal: sebagian lingkungan menolaknya */
+  if(r.status===404)return [];
+  if(!r.ok)throw new Error(r.status);
+  return await r.json();
 }
 async function findLyrics(s){
   const dur=audio.duration||0,nm=cleanName(s.name),hasA=s.artist&&s.artist!=="Local Music";
@@ -1799,8 +1797,8 @@ vb.textContent="V3.5 ◐";
   const H=(a,f)=>{try{ms.setActionHandler(a,f)}catch(e){}};
   H("play",()=>{if(!cur){togglePlay();return}audio.play().catch(()=>{})});
   H("pause",()=>audio.pause());
-  H("previoustrack",prev);
-  H("nexttrack",next);
+  H("previoustrack",()=>prev());
+  H("nexttrack",()=>next());
   H("stop",()=>{audio.pause();audio.currentTime=0;pos(true);st()});
   H("seekto",d=>{
     if(!isFinite(audio.duration))return;
@@ -1817,6 +1815,354 @@ vb.textContent="V3.5 ◐";
   st();
   const s0=cur&&byId(cur);if(s0)meta(s0);
 })();
+
+
+/* ===== V3.6: Search ala Spotify (hasil langsung muncul, tap untuk putar) ===== */
+vb.textContent="V3.6 ◐";
+document.head.insertAdjacentHTML("beforeend",`<style>
+body.sovo{overflow:hidden}
+#sov{display:none;position:fixed;inset:0;z-index:45;background:var(--bg);flex-direction:column}
+#sov.on{display:flex;animation:sovin .18s ease-out}
+@keyframes sovin{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.sovh{display:flex;align-items:center;gap:10px;padding:calc(12px + env(safe-area-inset-top)) 16px 10px}
+.sovh .sbox{flex:1;margin:0}
+.scancel{color:#fff;font-size:14px;padding:8px 2px}
+#sovch{padding:0 16px 6px}
+#sovb{flex:1;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:4px 20px calc(190px + env(safe-area-inset-bottom))}
+#sovb mark{background:none;color:var(--a);font-weight:700}
+.topc{display:flex;align-items:center;gap:14px;background:linear-gradient(135deg,color-mix(in srgb,var(--a) 28%,#1b1530),#ffffff08);border:1px solid #ffffff14;border-radius:20px;padding:16px;margin-bottom:6px}
+.topc .tcv{width:84px;height:84px;border-radius:14px;background:#ffffff14;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:30px;flex:0 0 auto;cursor:pointer}
+.topc .tcv img{width:100%;height:100%;object-fit:cover}
+.topc .tin{flex:1;min-width:0;cursor:pointer}
+.topc h3{font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topc p{font-size:12px;color:var(--m);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topc .tp{width:52px;height:52px;border-radius:50%;background:var(--a);color:#170d25;font-size:20px;flex:0 0 auto}
+</style>`);
+
+/* ---------- markup ---------- */
+var ov=document.createElement("div");
+ov.id="sov";
+ov.innerHTML='<div class="sovh"><div class="sbox" id="sovbox"><span class="si">⌕</span><input id="sovq" type="search" enterkeyhint="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Search songs, artists, playlists"><button class="sc" id="sovx">✕</button></div><button class="scancel" id="sovc">Cancel</button></div><div class="chips" id="sovch" style="display:none"></div><div id="sovb"></div>';
+document.body.appendChild(ov);
+
+/* ---------- state ---------- */
+var oq="",oTab="all",oOpen=false,oT=null;
+
+/* highlight huruf yang cocok (aman terhadap HTML) */
+function hl(t,q){
+  const w=q.trim().split(/\s+/).filter(Boolean).map(x=>x.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"));
+  if(!w.length)return esc(t);
+  try{return String(t==null?"":t).split(new RegExp("("+w.join("|")+")","gi")).map((p,i)=>i%2?"<mark>"+esc(p)+"</mark>":esc(p)).join("")}
+  catch(e){return esc(t)}
+}
+
+/* ---------- buka / tutup ---------- */
+function openSov(){
+  if(oOpen)return;
+  oOpen=true;
+  ov.classList.add("on");document.body.classList.add("sovo");
+  try{history.pushState({tab:tab,id:view&&view.id,sov:1},"")}catch(e){}
+  const q=$("sovq");q.value=oq;$("sovbox").classList.toggle("has",!!oq);
+  oRender();
+  q.focus();
+}
+function closeSov(back){
+  if(!oOpen)return;
+  oOpen=false;oq="";oTab="all";
+  ov.classList.remove("on");document.body.classList.remove("sovo");
+  $("sovq").blur();
+  if(back!==false&&history.state&&history.state.sov){try{history.back()}catch(e){}}
+}
+addEventListener("popstate",()=>{if(oOpen)closeSov(false)});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&oOpen)closeSov()});
+
+/* ---------- input ---------- */
+$("sovq").addEventListener("input",e=>{
+  oq=e.target.value;$("sovbox").classList.toggle("has",!!oq);
+  clearTimeout(oT);oT=setTimeout(()=>oRender(),60);
+});
+$("sovq").addEventListener("keydown",e=>{if(e.key==="Enter"){rememberS(oq);e.target.blur()}});
+$("sovx").onclick=()=>{oq="";const q=$("sovq");q.value="";$("sovbox").classList.remove("has");oRender();q.focus()};
+$("sovc").onclick=()=>closeSov();
+$("sovb").addEventListener("touchmove",()=>{const q=$("sovq");if(document.activeElement===q)q.blur()},{passive:true});
+
+/* ---------- aksi di hasil ---------- */
+function oPlay(id){rememberS(oq);play(id);const q=$("sovq");if(document.activeElement===q)q.blur()}
+function oFav(id){fav(id);oRender(true)}
+function oPlayAll(){
+  const r=oq.trim()?sFind(oq.trim()):null;
+  if(!r||!r.songs.length)return;
+  rememberS(oq);queue=r.songs.slice(1).map(s=>s.id);play(r.songs[0].id);
+}
+function oTabSet(k){oTab=k;oRender();$("sovb").scrollTop=0}
+function oUse(i){oq=sRec[i]||"";const q=$("sovq");q.value=oq;$("sovbox").classList.toggle("has",!!oq);oRender()}
+function oDel(i){sRec.splice(i,1);saveS();oRender(true)}
+function oClearRec(){sRec=[];saveS();oRender(true)}
+function oArtist(name){rememberS(oq);closeSov(false);go("artist",name)}
+function oPl(id){rememberS(oq);closeSov(false);go("pl",id)}
+
+/* ---------- tampilan ---------- */
+function oRow(s,q){
+  const on=s.id===cur,f=favs.includes(s.id);
+  return `<div class="row${on?" on":""}" data-id="${s.id}"><div class="cover" onclick="oPlay('${s.id}')">${covHTML(s)}</div><div class="info" onclick="oPlay('${s.id}')"><h3>${hl(s.name,q)}</h3><p>${hl(s.artist,q)}${on?" · Playing":""}</p></div><div class="acts"><button class="hb${f?" f":""}" onclick="oFav('${s.id}')">${f?"♥":"♡"}</button><button onclick="menu('${s.id}')">⋮</button></div></div>`;
+}
+function oIdle(){
+  let h="";
+  if(sRec.length)h+=`<div class="head2" style="margin-top:8px"><h2>Recent searches</h2><button onclick="oClearRec()">Clear</button></div><div class="rs">${sRec.map((x,i)=>`<div class="rsi"><span onclick="oUse(${i})">${esc(x)}</span><button onclick="oDel(${i})">✕</button></div>`).join("")}</div>`;
+  const rc=recent.map(byId).filter(Boolean).slice(0,6);
+  if(rc.length)h+=`<div class="head2"><h2>Play again</h2></div><div class="list">${rc.map(s=>oRow(s,"")).join("")}</div>`;
+  if(!h)h='<div class="empty big"><div class="bigicon">⌕</div>Type to search your library.</div>';
+  return h;
+}
+function oRender(keep){
+  const box=$("sovb"),ch=$("sovch"),st=box.scrollTop,q=oq.trim(),r=q?sFind(q):null;
+  if(!r){ch.style.display="none";box.innerHTML=oIdle();if(keep)box.scrollTop=st;return}
+  ch.style.display="flex";
+  ch.innerHTML=[["all","All"],["songs","Songs ("+r.songs.length+")"],["artists","Artists ("+r.artists.length+")"],["pl","Playlists ("+r.pls.length+")"]]
+    .map(([k,l])=>`<button class="chip${oTab===k?" on":""}" onclick="oTabSet('${k}')">${l}</button>`).join("");
+  if(!r.songs.length&&!r.artists.length&&!r.pls.length){
+    box.innerHTML=`<div class="empty big"><div class="bigicon">⌕</div>No results for "${esc(q)}"<br>Try another title or artist.</div>`;
+    return;
+  }
+  oArtL=r.artists;oPlL=r.pls;
+  const all=oTab==="all",lim=all?20:500;
+  let h="";
+  if(all&&r.songs.length){
+    const t=r.songs[0];
+    h+=`<div class="head2" style="margin-top:6px"><h2>Top result</h2></div><div class="topc"><div class="tcv" onclick="oPlay('${t.id}')">${covHTML(t)}</div><div class="tin" onclick="oPlay('${t.id}')"><h3>${hl(t.name,q)}</h3><p>Song · ${hl(t.artist,q)}</p></div><button class="tp" onclick="oPlay('${t.id}')">▶</button></div>`;
+  }
+  if((all||oTab==="songs")&&r.songs.length){
+    h+=`<div class="head2"><h2>Songs</h2>${all&&r.songs.length>lim?`<button onclick="oTabSet('songs')">See all ${r.songs.length}</button>`:""}</div>`;
+    h+=`<div class="acts2"><button class="pill" onclick="oPlayAll()">▶ Play all ${r.songs.length}</button></div>`;
+    h+=`<div class="list">${r.songs.slice(0,lim).map(s=>oRow(s,q)).join("")}</div>`;
+  }
+  if((all||oTab==="artists")&&r.artists.length){
+    const al=all?6:200;
+    h+=`<div class="head2"><h2>Artists</h2>${all&&r.artists.length>al?`<button onclick="oTabSet('artists')">See all</button>`:""}</div><div class="agrid">${r.artists.slice(0,al).map((x,i)=>{const f=x.songs.find(s=>s.cover)||x.songs[0];return `<div class="ac" onclick="oArtist(oArtL[${i}].name)"><div class="av">${f&&f.cover?covHTML(f):"♫"}</div><h4>${esc(x.name)}</h4><p>${x.songs.length} songs</p></div>`}).join("")}</div>`;
+  }
+  if((all||oTab==="pl")&&r.pls.length){
+    const pl=all?4:100;
+    h+=`<div class="head2"><h2>Playlists</h2>${all&&r.pls.length>pl?`<button onclick="oTabSet('pl')">See all</button>`:""}</div><div class="pgrid">${r.pls.slice(0,pl).map((p,i)=>`<div class="plc" onclick="oPl(oPlL[${i}].id)">${mosaic(p.songs)}<h3>${esc(p.name)}</h3><p>${p.songs.filter(byId).length} tracks</p></div>`).join("")}</div>`;
+  }
+  box.innerHTML=h;
+  if(keep)box.scrollTop=st;
+}
+var oArtL=[],oPlL=[];
+
+/* tanda "sedang diputar" ikut berubah di hasil pencarian */
+["play","loadstart"].forEach(e=>audio.addEventListener(e,()=>{
+  if(!oOpen)return;
+  document.querySelectorAll("#sovb .row").forEach(r=>{
+    const on=r.dataset.id===String(cur);
+    r.classList.toggle("on",on);
+    const p=r.querySelector(".info p");
+    if(p)p.textContent=p.textContent.replace(/ · Playing$/,"")+(on?" · Playing":"");
+  });
+}));
+
+/* ---------- titik masuk: bar search di Home dan ikon ⌕ di header (filter Library tetap) ---------- */
+(function(){
+  document.querySelectorAll(".sbfake").forEach(b=>b.onclick=openSov);
+  document.querySelectorAll(".hsb").forEach(b=>b.onclick=openSov);
+})();
+openSearch=openSov;
+
+
+/* ===== V3.7: cari + putar lagu online tanpa import (Audius, cover/album dari iTunes bila cocok) ===== */
+vb.textContent="V3.7 ◐";
+document.head.insertAdjacentHTML("beforeend",`<style>
+.ontag{font-size:11px;color:var(--m);font-weight:400}
+.dur{font-size:12px;color:var(--m);margin-right:2px}
+.onfoot{text-align:center;color:var(--m);font-size:11px;margin:12px 0 0}
+</style>`);
+
+var AU="https://api.audius.co/v1",APP="ALFISSLX";
+var ON={q:"",st:"idle",items:[],ctl:null},onC=new Map(),onT=null,onList=[];
+const fmtD=s=>{s=Math.round(s||0);return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")};
+
+/* ---------- ubah hasil Audius jadi objek lagu ---------- */
+function onMap(t){
+  const a=t.artwork&&(t.artwork["480x480"]||t.artwork["1000x1000"]||t.artwork["150x150"])||"";
+  return {
+    id:"au_"+t.id,online:true,src:"audius",
+    name:t.title||"Untitled",
+    artist:(t.user&&(t.user.name||t.user.handle))||"Unknown artist",
+    album:"Audius",dur:t.duration||0,
+    url:AU+"/tracks/"+encodeURIComponent(t.id)+"/stream?app_name="+APP,
+    blob:null,
+    cover:a?new Blob([],{type:"image/jpeg"}):null,_cu:a,coverUrl:a
+  };
+}
+
+/* ---------- putar lagu online lewat play() yang sudah ada ---------- */
+var _play=play;
+play=async function(id){
+  const s=ONL[id];
+  if(!s){audio.removeAttribute("crossorigin");return _play(id)}
+  cur=id;s._try=0;
+  if(objUrl){URL.revokeObjectURL(objUrl);objUrl=null}
+  audio.crossOrigin="anonymous"; /* perlu agar equalizer tidak membisukan suara */
+  audio.src=s.url;
+  upd();meta(s);
+  try{
+    await audio.play();
+    openPlayer();upd();meta(s);renderSongs();renderExtra();
+  }catch(e){
+    if(e&&e.name==="AbortError")return; /* lagu diganti saat masih loading */
+    console.error(e);notify("Unable to play music");
+  }
+};
+/* kalau server menolak mode CORS, coba sekali lagi tanpa itu */
+const _oe=audio.onerror;
+audio.onerror=function(e){const s=ONL[cur];if(s&&audio.crossOrigin&&!s._try)return;if(_oe)_oe.call(audio,e)};
+audio.addEventListener("error",()=>{
+  const s=ONL[cur];
+  if(!s||s._try||audio.src!==s.url)return;
+  s._try=1;audio.removeAttribute("crossorigin");audio.src=s.url;audio.play().catch(()=>{});
+});
+
+/* next / prev: setelah lagu online, lanjut ke hasil online berikutnya */
+var _next=next,_prev=prev;
+next=function(){
+  if(ONL[cur]&&!queue.length){
+    const i=onList.indexOf(cur);
+    if(i>=0&&i+1<onList.length)return play(onList[i+1]);
+  }
+  return _next();
+};
+prev=function(){
+  if(ONL[cur]){
+    if(audio.currentTime>3){audio.currentTime=0;return}
+    const i=onList.indexOf(cur);
+    if(i>0)return play(onList[i-1]);
+    audio.currentTime=0;return;
+  }
+  return _prev();
+};
+
+/* ---------- pencarian online ---------- */
+function onKick(){
+  clearTimeout(onT);
+  if(ON.ctl){try{ON.ctl.abort()}catch(e){}ON.ctl=null}
+  const q=oq.trim();
+  if(q.length<2){ON.q="";ON.st="idle";ON.items=[];return}
+  ON.q=q;
+  if(onC.has(q)){ON.items=onC.get(q);ON.st="ok";onList=ON.items.map(t=>t.id);return}
+  ON.st="loading";ON.items=[];
+  onT=setTimeout(()=>onFetch(q),350);
+}
+function onRetry(){onKick();oRender(true)}
+/* fetch dengan batas waktu TANPA AbortSignal (sebagian lingkungan menolak AbortSignal: DataCloneError) */
+function jget(url,ms){
+  return new Promise((res,rej)=>{
+    const t=setTimeout(()=>{const e=new Error("Timed out");e.name="TimeoutError";rej(e)},ms);
+    fetch(url).then(r=>{clearTimeout(t);res(r)},e=>{clearTimeout(t);rej(e)});
+  });
+}
+async function onFetch(q){
+  try{
+    const r=await jget(AU+"/tracks/search?query="+encodeURIComponent(q)+"&limit=25&app_name="+APP,10000);
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    const j=await r.json();
+    const items=(j.data||[])
+      .filter(t=>t&&t.id&&!t.is_delete&&t.is_streamable!==false&&!(t.access&&t.access.stream===false))
+      .map(t=>{const m=onMap(t);return ONL[m.id]||(ONL[m.id]=m)});
+    if(oq.trim()!==q)return;
+    onC.set(q,items);ON.items=items;ON.st="ok";onList=items.map(t=>t.id);
+    oRender(true);
+    onEnrich(items,q);
+  }catch(e){
+    if(oq.trim()!==q)return;
+    ON.st="err";
+    ON.msg=/^HTTP/.test(e.message)?e.message:(e.name+": "+e.message);
+    console.error("Audius search failed:",e);
+    oRender(true);
+  }
+}
+
+/* cover dan nama album dari iTunes, hanya kalau judul DAN artisnya cocok (judul/artis tetap dari Audius) */
+async function onEnrich(items,q){
+  const need=items.filter(t=>!t.cover&&!t._it).slice(0,8);
+  if(!need.length)return;
+  let changed=false;
+  await Promise.all(need.map(async t=>{
+    t._it=1;
+    try{
+      const r=await jget("https://itunes.apple.com/search?term="+encodeURIComponent(t.name+" "+t.artist)+"&entity=song&limit=5",6000);
+      const j=await r.json(),nt=norm(t.name),na=norm(t.artist);
+      const m=(j.results||[]).find(x=>{
+        const a=norm(x.trackName),b=norm(x.artistName);
+        return a&&b&&(a===nt||a.includes(nt)||nt.includes(a))&&(b===na||b.includes(na)||na.includes(b));
+      });
+      if(m){
+        const u=(m.artworkUrl100||"").replace("100x100","600x600");
+        if(u){t._cu=u;t.coverUrl=u;t.cover=new Blob([],{type:"image/jpeg"});changed=true}
+        if(m.collectionName){t.album=m.collectionName;changed=true}
+      }
+    }catch(e){}
+  }));
+  if(changed&&oOpen&&oq.trim()===q)oRender(true);
+}
+
+/* ---------- tampilan ---------- */
+function onRow(t,q){
+  const on=t.id===cur;
+  return `<div class="row${on?" on":""}" data-id="${t.id}"><div class="cover" onclick="onPlay('${t.id}')">${covHTML(t)}</div><div class="info" onclick="onPlay('${t.id}')"><h3>${hl(t.name,q)}</h3><p>${hl(t.artist,q)} · Audius${on?" · Playing":""}</p></div><div class="acts"><span class="dur">${t.dur?fmtD(t.dur):""}</span><button onclick="onQ('${t.id}')">＋</button></div></div>`;
+}
+function onPlay(id){rememberS(oq);play(id);const q=$("sovq");if(document.activeElement===q)q.blur()}
+function onQ(id){queue.push(id);notify("Added to queue");renderExtra()}
+function onSection(q){
+  const all=oTab==="all",lim=all?8:25;
+  let h=`<div class="head2"><h2>Online <small class="ontag">· Audius</small></h2>${all&&ON.st==="ok"&&ON.items.length>lim?`<button onclick="oTabSet('online')">See all ${ON.items.length}</button>`:""}</div>`;
+  if(ON.st==="loading")h+='<div class="empty">Searching online…</div>';
+  else if(ON.st==="err")h+='<div class="empty">Audius did not respond.<br><small style="color:var(--m)">'+esc(ON.msg||"")+'</small><br><button class="pill" style="margin-top:12px" onclick="onRetry()">Try again</button></div>';
+  else if(ON.st==="ok"){
+    if(!ON.items.length)h+='<div class="empty">No online results.</div>';
+    else h+=`<div class="list">${ON.items.slice(0,lim).map(t=>onRow(t,q)).join("")}</div><p class="onfoot">Streaming from Audius</p>`;
+  }
+  return h;
+}
+var _oR=oRender;
+oRender=function(keep){
+  if(oTab==="online"&&oq.trim().length<2)oTab="all";
+  _oR(keep);
+  const q=oq.trim();
+  if(q.length<2)return;
+  const box=$("sovb"),ch=$("sovch"),st=box.scrollTop;
+  ch.insertAdjacentHTML("beforeend",`<button class="chip${oTab==="online"?" on":""}" onclick="oTabSet('online')">Online${ON.st==="ok"?" ("+ON.items.length+")":""}</button>`);
+  if(oTab!=="all"&&oTab!=="online")return;
+  if(box.querySelector(".empty.big")){
+    if(ON.st==="ok"&&!ON.items.length)return; /* lokal dan online sama-sama kosong */
+    box.innerHTML="";
+  }
+  box.insertAdjacentHTML("beforeend",onSection(q));
+  if(keep)box.scrollTop=st;
+};
+
+/* ---------- sambungan ke input, riwayat, dan tutup ---------- */
+$("sovq").addEventListener("input",onKick);
+$("sovx").addEventListener("click",onKick);
+var _oU=oUse;
+oUse=function(i){_oU(i);onKick();oRender(true)};
+var _cs=closeSov;
+closeSov=function(b){
+  if(ON.ctl){try{ON.ctl.abort()}catch(e){}ON.ctl=null}
+  clearTimeout(onT);ON.q="";ON.st="idle";ON.items=[];
+  _cs(b);
+};
+
+/* selama layar search terbuka, memutar lagu TIDAK membuka pemutar penuh (mini player tetap bisa di-tap) */
+var oQuiet=0;
+var _op=openPlayer;
+openPlayer=function(){if(oQuiet>0)return;return _op.apply(this,arguments)};
+var _p2=play;
+play=function(id){
+  if(!oOpen)return _p2(id);
+  oQuiet++;
+  const r=_p2(id);
+  Promise.resolve(r).finally(()=>{oQuiet--});
+  return r;
+};
 
 
 /* start */
