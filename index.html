@@ -1741,6 +1741,84 @@ renderExtra=function(){if(tab==="search")return renderSearch();_re3()};
 })();
 
 
+/* ===== V3.5: kontrol layar kunci / notifikasi (Media Session lengkap) ===== */
+vb.textContent="V3.5 ◐";
+(function(){
+  if(!("mediaSession" in navigator))return;
+  const ms=navigator.mediaSession;
+  const ios=/iP(hone|ad|od)/.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+  const icon=new URL("icon-512.png",location.href).href;
+
+  /* cover lagu, atau ikon app kalau lagu tidak punya cover */
+  function art(s){
+    let a=[];
+    try{
+      if(s&&s.cover&&(s.cover.size>0||s._cu)){
+        const u=cu(s);
+        if(u)a=[96,128,192,256,384,512].map(n=>({src:u,sizes:n+"x"+n,type:s.cover.type||"image/jpeg"}));
+      }
+    }catch(e){}
+    return a.length?a:[{src:icon,sizes:"512x512",type:"image/png"}];
+  }
+  function sig(s){return s?s.id+"|"+(s._cu||"")+"|"+(s.cover?s.cover.size:0)+"|"+s.name+"|"+s.artist:""}
+  var lastSig="";
+
+  meta=function(s){
+    if(!s)return;
+    try{
+      ms.metadata=new MediaMetadata({title:s.name||"Unknown",artist:s.artist||"Unknown artist",album:s.album||"ALFISSLX",artwork:art(s)});
+      lastSig=sig(s);
+    }catch(e){}
+    pos(true);st();
+  };
+
+  /* seek bar di layar kunci */
+  var lp=0;
+  function pos(force){
+    if(!ms.setPositionState)return;
+    const now=Date.now();
+    if(!force&&now-lp<5000)return;
+    lp=now;
+    const d=audio.duration;
+    try{
+      if(isFinite(d)&&d>0)ms.setPositionState({duration:d,playbackRate:audio.playbackRate||1,position:Math.min(Math.max(audio.currentTime||0,0),d)});
+      else ms.setPositionState();
+    }catch(e){}
+  }
+  function st(){try{ms.playbackState=audio.paused?(cur?"paused":"none"):"playing"}catch(e){}}
+
+  ["play","pause","ended","emptied"].forEach(e=>audio.addEventListener(e,()=>{st();pos(true)}));
+  ["loadedmetadata","durationchange","seeked","ratechange"].forEach(e=>audio.addEventListener(e,()=>pos(true)));
+  audio.addEventListener("timeupdate",()=>pos(false));
+  document.addEventListener("visibilitychange",()=>{if(!document.hidden){st();pos(true)}});
+
+  /* kalau cover baru ketemu (iTunes / edit), perbarui notifikasi */
+  setInterval(()=>{const s=cur&&byId(cur);if(s&&sig(s)!==lastSig)meta(s)},4000);
+
+  /* tombol */
+  const H=(a,f)=>{try{ms.setActionHandler(a,f)}catch(e){}};
+  H("play",()=>{if(!cur){togglePlay();return}audio.play().catch(()=>{})});
+  H("pause",()=>audio.pause());
+  H("previoustrack",prev);
+  H("nexttrack",next);
+  H("stop",()=>{audio.pause();audio.currentTime=0;pos(true);st()});
+  H("seekto",d=>{
+    if(!isFinite(audio.duration))return;
+    const t=Math.min(Math.max(d.seekTime||0,0),audio.duration);
+    if(d.fastSeek&&audio.fastSeek)audio.fastSeek(t);else audio.currentTime=t;
+    pos(true);
+  });
+  /* iOS: kalau tombol seek dipasang, tombol next/prev hilang dari layar kunci */
+  if(!ios){
+    H("seekbackward",d=>{audio.currentTime=Math.max(0,audio.currentTime-(d.seekOffset||10));pos(true)});
+    H("seekforward",d=>{audio.currentTime=Math.min(audio.duration||1e9,audio.currentTime+(d.seekOffset||10));pos(true)});
+  }
+
+  st();
+  const s0=cur&&byId(cur);if(s0)meta(s0);
+})();
+
+
 /* start */
 (async()=>{
   favs=ls("favorites",[]);recent=ls("recent",[]);lists=ls("playlists",[]);
